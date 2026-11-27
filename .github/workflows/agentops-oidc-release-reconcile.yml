@@ -14,10 +14,10 @@ permissions:
   contents: read
   id-token: write
   attestations: write
-  pull-requests: write
 
 jobs:
   slsa-l2-cyclonedx-and-reconcile:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
