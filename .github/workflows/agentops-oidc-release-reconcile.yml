@@ -1,0 +1,134 @@
+name: AgentOps OIDC Release & Reconcile
+on:
+  workflow_dispatch:
+    inputs:
+      probe_run_id:
+        description: "Probe correlation identifier"
+        required: false
+        default: "manual-dispatch"
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+  pull-requests: write
+
+jobs:
+  slsa-l2-cyclonedx-and-reconcile:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build deterministic bundle & CycloneDX 1.5 SBOM
+        id: build
+        shell: python3 {0}
+        run: |
+          import datetime as dt
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          out = Path("dist")
+          out.mkdir(parents=True, exist_ok=True)
+          sha = os.environ["GITHUB_SHA"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          run_id = os.environ["GITHUB_RUN_ID"]
+          now_utc = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+          artifact = {
+              "schema": "agentops-release-bundle/1",
+              "repository": repo,
+              "commit_sha": sha,
+              "workflow_run_id": run_id,
+              "built_at_utc": now_utc,
+              "auth_mode": "github_actions_ephemeral_oidc",
+              "claims": [],
+          }
+          art_bytes = (json.dumps(artifact, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+          art_path = out / "artifact.json"
+          art_path.write_bytes(art_bytes)
+          art_sha256 = hashlib.sha256(art_bytes).hexdigest()
+
+          # Digest readback verification
+          readback_sha256 = hashlib.sha256(art_path.read_bytes()).hexdigest()
+          assert readback_sha256 == art_sha256
+
+          sbom = {
+              "bomFormat": "CycloneDX",
+              "specVersion": "1.5",
+              "version": 1,
+              "serialNumber": f"urn:uuid:00000000-0000-4000-8000-{sha[:12]}",
+              "metadata": {
+                  "timestamp": now_utc,
+                  "component": {
+                      "type": "application",
+                      "name": repo.split("/", 1)[1],
+                      "version": sha[:12],
+                      "hashes": [{"alg": "SHA-256", "content": art_sha256}],
+                  },
+              },
+              "components": [
+                  {
+                      "type": "library",
+                      "name": f"{repo.split('/', 1)[1]}-bundle",
+                      "version": sha[:12],
+                      "hashes": [{"alg": "SHA-256", "content": art_sha256}],
+                  }
+              ],
+          }
+          sbom_bytes = (json.dumps(sbom, sort_keys=True, indent=2) + "\n").encode("utf-8")
+          (out / "cyclonedx-sbom.json").write_bytes(sbom_bytes)
+          sbom_sha256 = hashlib.sha256(sbom_bytes).hexdigest()
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"artifact_sha256={art_sha256}\n")
+              fh.write(f"sbom_sha256={sbom_sha256}\n")
+
+      - name: Attest SLSA Build L2 provenance via GitHub OIDC
+        id: attest
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/artifact.json
+
+      - name: Record verification summary receipt
+        env:
+          ARTIFACT_SHA: ${{ steps.build.outputs.artifact_sha256 }}
+          SBOM_SHA: ${{ steps.build.outputs.sbom_sha256 }}
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+          ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          summary = {
+              "schema": "agentops-actions-oidc-receipt/1",
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "commit_sha": os.environ["GITHUB_SHA"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "actor": os.environ["GITHUB_ACTOR"],
+              "event_name": os.environ["GITHUB_EVENT_NAME"],
+              "auth_mode": "github_actions_ephemeral_oidc",
+              "artifact_sha256": os.environ["ARTIFACT_SHA"],
+              "sbom_sha256": os.environ["SBOM_SHA"],
+              "attestation_bundle_present": bool(os.environ.get("BUNDLE_PATH")),
+              "attestation_url": os.environ.get("ATTESTATION_URL", ""),
+              "retention_days": 30,
+              "claims": [],
+          }
+          pathlib.Path("dist/oidc-receipt.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+          PY
+
+      - name: Upload 30-day retained release & provenance evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentops-release-evidence
+          path: |
+            dist/artifact.json
+            dist/cyclonedx-sbom.json
+            dist/oidc-receipt.json
+          retention-days: 30
